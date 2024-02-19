@@ -93,6 +93,7 @@ from .utils import get_ma_status
 from .compiler import CompiledModuleWrapper
 from ..ops.adam import FusedAdam
 from ..moe.sharded_moe import TopKGate, MOELayer
+from ..moe.capacity_bins import optimize_bins
 from ..moe.layer import MoE
 from ..moe.utils import is_moe_param
 from ..git_version_info import version
@@ -3612,3 +3613,81 @@ class DeepSpeedEngine(Module):
             self.optimizer.empty_partition_cache()
             gc.collect()
             get_accelerator().empty_cache()
+
+    def optimize_moe(self, step, max_grouped_experts=1):
+        """ Optimize MoE gate capacity bins
+
+            If MoE is using capacity bins, optimize the bins based to running stats.
+            In order to reduce the number of compilation recipes, we optimize a set
+            of grouped gates togather.
+            The grouped gates must have same number of experts.
+        """
+        if not self.has_moe_layers:
+            return
+
+        # find all gates with capacity factor
+        gate_with_capacity_bins_idx = [i for i, gate in enumerate(self.gate_modules) if gate.has_capacity_bins()]
+        if len(gate_with_capacity_bins_idx) == 0:
+            return
+
+        # handle only gates have capacity bins usage statistics
+        gate_capacity_bin_stats = OrderedDict()
+        for i in gate_with_capacity_bins_idx:
+            gate = self.gate_modules[i]
+            if hasattr(gate, 'get_stats'):
+                stats = gate.get_stats(incremental=False)
+                if stats is not None and 'capacity_bins' in stats:
+                    gate_capacity_bin_stats[i] = stats['capacity_bins']
+        if len(gate_capacity_bin_stats) == 0:
+            return
+
+        del gate_with_capacity_bins_idx  # remove this list is out of date
+
+        log_dist(f'step={step}, optimizing moe capacity bins', ranks=[0])
+
+        # divide gates into groups up to max_grouped_experts or until different num_experts encountered
+        gate_groups = []
+        first_gate_idx = list(gate_capacity_bin_stats.keys())[0]
+        current_group = [first_gate_idx]
+        current_group_n_experts = self.num_experts[first_gate_idx]
+        for i in list(gate_capacity_bin_stats.keys())[1:]:
+            if self.num_experts[i] == current_group_n_experts and len(current_group) < max_grouped_experts:
+                current_group.append(i)
+            else:
+                gate_groups.append(current_group)
+                current_group = [i]
+                current_group_n_experts = self.num_experts[i]
+        gate_groups.append(current_group)
+
+        # for each group, (1) accumulate stats (2) calculate optimized capacity and (3) reconfigure bins
+        for gate_group in gate_groups:
+            group_stats = []
+            for i in gate_group:
+                group_stats.append(gate_capacity_bin_stats[i])
+
+            # sanity - verify all gates in groups have same bins edges
+            bins_edges = [stats['edges'] for stats in group_stats]
+            same_edges = all(torch.equal(bins_edges[0], tensor) for tensor in bins_edges[1:])
+            assert same_edges, f'Got different capacity bin edges for group={gate_group} edges={bins_edges}'
+
+            # accumulate usage
+            stacked_usage = torch.stack([stats['usage'] for stats in group_stats], dim=0)
+            total_group_usage = torch.sum(stacked_usage, dim=0)
+
+            # find optimized bins for this group
+            min_range = group_stats[0]['min_range']
+            current_bins = group_stats[0]['edges']
+            alignment = group_stats[0]['alignment']
+            min_bin_size = group_stats[0]['min_bin_size']
+            new_bins = optimize_bins(min_range=min_range,
+                                     bins=current_bins,
+                                     bins_usage=total_group_usage,
+                                     alignment=alignment,
+                                     min_bin_size=min_bin_size)
+
+            # configure gates in group with new bins
+            for i in gate_group:
+                gate = self.gate_modules[i]
+                capacity_bins = gate.get_capacity_bins()
+                capacity_bins.set_bins(new_bins)
+            log_dist(f'step={step}, optimize capacity bins for group={gate_group} bins={new_bins}', ranks=[0])

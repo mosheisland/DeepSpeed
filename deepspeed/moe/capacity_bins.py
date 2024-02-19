@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+import math
 import torch
 from typing import Union
 from deepspeed import comm as dist
@@ -31,18 +32,24 @@ class CapacityBins:
         initialized to bins with exponentially growing width.
     """
 
-    def __init__(self, k: int, num_experts: int, num_capacity_bins: int, capacity_bins_exp_base: float,
-                 capacity_bins_alignment: int) -> None:
+    def __init__(self,
+                 k: int,
+                 num_experts: int,
+                 num_capacity_bins: int,
+                 capacity_bins_exp_base: float,
+                 capacity_bins_alignment: int,
+                 min_bin_size: int = 1) -> None:
         self.k = k
         self.num_experts = num_experts
         self.num_capacity_bins = num_capacity_bins
         self.capacity_bins_exp_base = capacity_bins_exp_base
         self.configured_alignment = capacity_bins_alignment
+        self.min_bin_size = min_bin_size
+        assert self.min_bin_size > 0, f'CapacityBins min_bin_size must be > 0, got {min_bin_size}'
         self.device = None
         self.min_tokens_per_expert = None
         self.max_tokens_per_expert = None
         self.alignment = None
-        self.min_bin_size = None
         self.capacity_bins = None
         self.bins_usage = None
         self.bins_usage_last = None
@@ -157,3 +164,87 @@ class CapacityBins:
             # generate bins
             self.capacity_bins = self._generate_bins()
         return self.capacity_bins
+
+
+def optimize_bins(min_range, bins: torch.Tensor, bins_usage: torch.Tensor, alignment, min_bin_size) -> list:
+    """ Optimize MOE capacity bins according to collected bins usage statistics
+
+    The bins are optimized to minimize the cost of binning.
+    The cost of each bin is defined as the additional tokens processed in this bin.
+    Since we don't have the actual capacities that were mapped to each bin, we use the median of the bin.
+    After we calculate the cost of all bins, we iteratively try to replace the lowest and highest cost bins
+    with 2 bins: the original highest cost bin and the median of the highest cost bin.
+    This way, we keep the number of bins constant while decreasing the overall cost of binning.
+
+    For example:
+        Given bins [150, 200, 250, 300] with start of range=100
+        And usage  [100, 0,   50,  10 ]
+
+        We first calculate the cost of eac bin:
+        Cost:      [25*100, 25*0, 25*50, 25*10] = [2500, 0, 1250, 250]
+
+        Lowest cost bin is 200 (index=1)
+        Highest cost bin is 150 (index=0)
+
+        First iteration of optimization:
+        Remove bin1 and split bin0 --> [125, 150, 250, 300]
+    """
+
+    def align_to(value):
+        return int(math.ceil(value / alignment) * alignment)
+
+    # sort bins by their cost of usage (we want to split high cost bins)
+    # we assume that for each bin, the cost is 1/2 of its width * usage count
+    shifted_bins = torch.cat([torch.tensor([min_range], dtype=bins.dtype, device=bins.device), bins[:-1]])
+    width = bins - shifted_bins
+    cost = bins_usage * width / 2.0
+    sorted_cost = torch.argsort(cost, descending=False, stable=True).tolist()
+
+    # sorted cost is in ascending order
+    # min_sort_idx is current index into sorted_cost for candidate bin to be removed
+    # max_sort_idx is current index into sorted_cost for candidate bin to be split
+    bins = bins.tolist()
+    n_bins = len(bins)
+    min_sort_idx = 0
+    max_sort_idx = n_bins - 1
+    new_bins = []
+    while min_sort_idx <= max_sort_idx:
+        # if same cost, keep all remaining bins and exit
+        # this also handles the case of min_sort_idx == max_sort_idx
+        min_cost = cost[sorted_cost[min_sort_idx]]
+        max_cost = cost[sorted_cost[max_sort_idx]]
+        if min_cost == max_cost:
+            bin_indexes = sorted_cost[min_sort_idx:max_sort_idx + 1]
+            new_bins.extend([bins[idx] for idx in bin_indexes])
+            break
+
+        # last bin can't be removed
+        min_bin_idx = sorted_cost[min_sort_idx]
+        if min_bin_idx == (n_bins - 1):
+            new_bins.append(bins[min_bin_idx])
+            min_sort_idx += 1
+            continue
+
+        # calculate the left & right bin's width of the candidate bin after we split it to 2
+        # verify that both left & right will meet the min bin size requirement
+        max_bin_idx = sorted_cost[max_sort_idx]
+        max_bin_start = min_range if max_bin_idx == 0 else bins[max_bin_idx - 1]
+        max_bin_end = bins[max_bin_idx]
+        mid_point = (max_bin_start + max_bin_end) // 2
+        mid_point = align_to(mid_point)
+        left_bin_width = mid_point - max_bin_start
+        right_bin_width = max_bin_end - mid_point
+        if left_bin_width < min_bin_size or right_bin_width < min_bin_size:
+            new_bins.append(bins[max_bin_idx])
+            max_sort_idx -= 1
+            continue
+
+        # skip min cost bin and split max cost bin
+        new_bins.append(mid_point)
+        new_bins.append(max_bin_end)
+        min_sort_idx += 1
+        max_sort_idx -= 1
+
+    # sort the bins in ascending order
+    bins = sorted(new_bins)
+    return bins
