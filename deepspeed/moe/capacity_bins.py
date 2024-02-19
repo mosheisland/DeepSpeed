@@ -10,7 +10,7 @@ from deepspeed import comm as dist
 from deepspeed.utils import groups
 
 
-class CapacityBins:
+class CapacityBins(torch.nn.Module):
     """ CapacityBins - maps current capacity value into capacity bins.
 
         When using drop_tokens=false, the capacity at each iteration will differ since
@@ -39,6 +39,7 @@ class CapacityBins:
                  capacity_bins_exp_base: float,
                  capacity_bins_alignment: int,
                  min_bin_size: int = 1) -> None:
+        super().__init__()
         self.k = k
         self.num_experts = num_experts
         self.num_capacity_bins = num_capacity_bins
@@ -98,12 +99,14 @@ class CapacityBins:
         return bins[index]
 
     def _update_stats(self, index):
-        if self.bins_usage is None:
-            self.bins_usage = torch.zeros(self.num_capacity_bins,
-                                          dtype=torch.long,
-                                          device=index.device,
-                                          requires_grad=False).detach()
-        self.bins_usage[index] += 1
+        # currently we maintain stats for training only
+        if self.training:
+            if self.bins_usage is None:
+                self.bins_usage = torch.zeros(self.num_capacity_bins,
+                                              dtype=torch.long,
+                                              device=index.device,
+                                              requires_grad=False).detach()
+            self.bins_usage[index] += 1
 
     def _generate_bins(self, force_start_bin=False):
         # create exponentially growing width bins, and normalize width sum to 1.0
