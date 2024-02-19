@@ -33,6 +33,9 @@ class MoE(nn.Module):
         use_tutel (bool, optional): default=False, whether to use Tutel optimizations (if installed).
         enable_expert_tensor_parallelism (bool, optional): default=False, whether to use tensor parallelism for experts
         top2_2nd_expert_sampling (bool, optional): default=True, whether to perform sampling for 2nd expert
+        num_capacity_bins (int, optional): default=0, number of capacity bins to use in case of drop_tokens=False
+        capacity_bins_exp_base (float, optional): default=2.0, in case of capacity bins, exponential growing factor for bin width
+        capacity_bins_alignment (int, optional): default=1, in case of capacity bins, required bins alignment
     """
 
     def __init__(self,
@@ -50,7 +53,10 @@ class MoE(nn.Module):
                  use_rts: bool = True,
                  use_tutel: bool = False,
                  enable_expert_tensor_parallelism: bool = False,
-                 top2_2nd_expert_sampling: bool = True) -> None:
+                 top2_2nd_expert_sampling: bool = True,
+                 num_capacity_bins: int = 0,
+                 capacity_bins_exp_base: float = 2.0,
+                 capacity_bins_alignment: int = 1):
 
         super(MoE, self).__init__()
 
@@ -72,7 +78,8 @@ class MoE(nn.Module):
         experts = Experts(expert, self.num_local_experts, self.expert_group_name)
         self.deepspeed_moe = MOELayer(TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
                                                min_capacity, noisy_gate_policy, drop_tokens, use_rts,
-                                               top2_2nd_expert_sampling),
+                                               top2_2nd_expert_sampling, num_capacity_bins, capacity_bins_exp_base,
+                                               capacity_bins_alignment),
                                       experts,
                                       self.expert_group_name,
                                       self.ep_size,
