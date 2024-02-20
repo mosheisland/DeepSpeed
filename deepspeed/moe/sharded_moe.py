@@ -408,7 +408,8 @@ class TopKGate(Module):
                  top2_2nd_expert_sampling: bool = True,
                  num_capacity_bins: int = 0,
                  capacity_bins_exp_base: float = 2.0,
-                 capacity_bins_alignment: int = 1) -> None:
+                 capacity_bins_alignment: int = 1,
+                 configured_bins: Union[list, None] = None) -> None:
         super().__init__()
 
         # Only top-1 and top-2 are supported at the moment.
@@ -431,8 +432,12 @@ class TopKGate(Module):
         if not self.drop_tokens and num_capacity_bins > 0:
             assert capacity_bins_exp_base > 1.0, \
                 f'capacity_bins_exp_base must be > 1.0, but got {capacity_bins_exp_base}'
-            self.capacity_bins = CapacityBins(k, num_experts, num_capacity_bins, capacity_bins_exp_base,
-                                              capacity_bins_alignment)
+            self.capacity_bins = CapacityBins(k,
+                                              num_experts,
+                                              num_capacity_bins,
+                                              capacity_bins_exp_base,
+                                              capacity_bins_alignment,
+                                              configured_bins=configured_bins)
 
     def forward(self,
                 input: torch.Tensor,

@@ -28,8 +28,8 @@ class CapacityBins(torch.nn.Module):
         which enables to dynamically update the capacity bins to optimize performance (i.e. to
         minimize the number of dummy extra tokens that are routed).
 
-        Upon initialization, before any usage statistics is available, the capacity bins are
-        initialized to bins with exponentially growing width.
+        Upon initialization, if configured_bins provided, use configured_bins to initialize the bins.
+        Otherwise, the capacity bins are initialized to bins with exponentially growing width.
     """
 
     def __init__(self,
@@ -38,22 +38,39 @@ class CapacityBins(torch.nn.Module):
                  num_capacity_bins: int,
                  capacity_bins_exp_base: float,
                  capacity_bins_alignment: int,
-                 min_bin_size: int = 1) -> None:
+                 min_bin_size: int = 1,
+                 configured_bins: Union[list, None] = None) -> None:
         super().__init__()
         self.k = k
         self.num_experts = num_experts
         self.num_capacity_bins = num_capacity_bins
         self.capacity_bins_exp_base = capacity_bins_exp_base
         self.configured_alignment = capacity_bins_alignment
+        assert min_bin_size > 0, f'CapacityBins min_bin_size must be > 0, got {min_bin_size}'
         self.min_bin_size = min_bin_size
-        assert self.min_bin_size > 0, f'CapacityBins min_bin_size must be > 0, got {min_bin_size}'
-        # we don't know the range of the capacity bins, therefore we create a zeroed tensor
-        # when we load from checkpoint, or during the first forward, we update the bins
-        # note that if the first element =0, it marks that capacity_bins is not initialized
+        if configured_bins is not None:
+            assert len(configured_bins) == self.num_capacity_bins, \
+                f'Configured bins ({configured_bins}) does not match num capacity bins ({self.num_capacity_bins})'
+            assert all(bin_edge > 0 for bin_edge in configured_bins), \
+                'Configured bin edges must be > 0'
+            assert all(configured_bins[i] < configured_bins[i+1] for i in range(len(configured_bins)-1)), \
+                'Configured bin edges must be a strictly increasing list'
+
+        # initialize usage stats
         zero_bins = torch.zeros(num_capacity_bins, dtype=torch.long, device='cpu', requires_grad=False)
-        self.register_buffer('capacity_bins', zero_bins.clone().detach())
         self.register_buffer('bins_usage', zero_bins.clone().detach())
         self.register_buffer('bins_usage_last', zero_bins.clone().detach())
+
+        # initialize bin edges
+        if configured_bins is not None:
+            self.register_buffer('capacity_bins',
+                                 torch.tensor(configured_bins, dtype=torch.long, device='cpu', requires_grad=False))
+        else:
+            # we don't know the range of the capacity bins, therefore we create a zeroed tensor
+            # when we load from checkpoint, or during the first forward, we update the bins
+            # note that if the first element =0, it marks that capacity_bins is not initialized
+            self.register_buffer('capacity_bins', zero_bins.clone().detach())
+
         self.device = None
         self.min_tokens_per_expert = None
         self.max_tokens_per_expert = None
@@ -141,6 +158,16 @@ class CapacityBins(torch.nn.Module):
 
         return bin_edges
 
+    def _verify_configured_bins(self):
+        """ This method runs once (at first forward) and verifies that configured bins are valid """
+        # verify configured bins range
+        assert self.capacity_bins[0].item() >= self.min_tokens_per_expert
+        assert self.capacity_bins[-1].item() >= self.max_tokens_per_expert
+        # verify configured bins alignment
+        alignment = torch.tensor(self.alignment, dtype=torch.long, device=self.device)
+        assert torch.remainder(self.capacity_bins, alignment).sum().item() == 0, \
+            f'Invalid capacity_bins={self.capacity_bins.clone().detach().cpu().tolist()}, alignment={self.alignment} '
+
     def _get_capacity_bins(self, gate_output: torch.Tensor) -> Union[torch.Tensor, None]:
         """ Generates capacity bins with exponential growing width.
 
@@ -173,9 +200,12 @@ class CapacityBins(torch.nn.Module):
                 tp_alignment = groups.mpu.get_tensor_model_parallel_world_size()
             self.alignment = max(self.configured_alignment, tp_alignment)
 
-        # if not loading from a checkpoint, initialize bins
-        if self.capacity_bins[0] == 0:
-            self.capacity_bins = self._generate_bins()
+            # if bins configured (either configured by user or loaded from checkpoint) - verify valid bins
+            # otherwise, initialize bins
+            if self.capacity_bins[0] > 0:
+                self._verify_configured_bins()
+            else:
+                self.capacity_bins = self._generate_bins()
 
         return self.capacity_bins
 
