@@ -47,30 +47,42 @@ class CapacityBins(torch.nn.Module):
         self.configured_alignment = capacity_bins_alignment
         self.min_bin_size = min_bin_size
         assert self.min_bin_size > 0, f'CapacityBins min_bin_size must be > 0, got {min_bin_size}'
+        # we don't know the range of the capacity bins, therefore we create a zeroed tensor
+        # when we load from checkpoint, or during the first forward, we update the bins
+        # note that if the first element =0, it marks that capacity_bins is not initialized
+        zero_bins = torch.zeros(num_capacity_bins, dtype=torch.long, device='cpu', requires_grad=False)
+        self.register_buffer('capacity_bins', zero_bins.clone().detach())
+        self.register_buffer('bins_usage', zero_bins.clone().detach())
+        self.register_buffer('bins_usage_last', zero_bins.clone().detach())
         self.device = None
         self.min_tokens_per_expert = None
         self.max_tokens_per_expert = None
         self.alignment = None
-        self.capacity_bins = None
-        self.bins_usage = None
-        self.bins_usage_last = None
-        self.bins_usage_since_bins_configured = None
 
     def set_bins(self, bins: list):
-        self.capacity_bins = torch.tensor(bins, dtype=torch.long, device=self.device)
-        self.bins_usage = None
-        self.bins_usage_last = None
+        with (torch.no_grad()):
+            # set the new capacity bins and clear the usage stats (not relevant for new bins)
+            self.capacity_bins.copy_(torch.tensor(bins, dtype=torch.long, device=self.device))
+            self.bins_usage.zero_()
+            self.bins_usage_last.zero_()
 
     def get_stats(self, incremental=True):
-        if self.bins_usage is None:
+
+        def is_usage_data_available(usage_tensor):
+            with torch.no_grad():
+                return usage_tensor.sum().item() > 0
+
+        if not is_usage_data_available(self.bins_usage):
             return None
 
         with torch.no_grad():
             bins_usage = self.bins_usage.clone().detach()
             dist.all_reduce(bins_usage, op=dist.ReduceOp.SUM, group=dist.get_world_group())
             if incremental:
-                delta_bins_usage = bins_usage - self.bins_usage_last if self.bins_usage_last is not None else bins_usage
-                self.bins_usage_last = bins_usage.clone().detach()
+                delta_bins_usage = bins_usage
+                if is_usage_data_available(self.bins_usage_last):
+                    delta_bins_usage -= self.bins_usage_last
+                self.bins_usage_last.copy_(bins_usage.clone().detach())
                 bins_usage = delta_bins_usage
 
             bins_usage = bins_usage.to('cpu')
@@ -101,11 +113,6 @@ class CapacityBins(torch.nn.Module):
     def _update_stats(self, index):
         # currently we maintain stats for training only
         if self.training:
-            if self.bins_usage is None:
-                self.bins_usage = torch.zeros(self.num_capacity_bins,
-                                              dtype=torch.long,
-                                              device=index.device,
-                                              requires_grad=False).detach()
             self.bins_usage[index] += 1
 
     def _generate_bins(self, force_start_bin=False):
@@ -153,10 +160,11 @@ class CapacityBins(torch.nn.Module):
         Returns:
             bins tensor (torch.Tensor dtype=torch.long)
         """
-        if self.capacity_bins is None:
+        # in case of first forward, initialize information based on gate_output
+        if self.min_tokens_per_expert is None:
+            self.device = gate_output.device
             # calculate optimal and worst case (min and max) tokens per expert
             total_tokens = torch.tensor(self.k * gate_output.shape[0], device=gate_output.device).to(torch.long)
-            self.device = gate_output.device
             self.min_tokens_per_expert = torch.ceil(total_tokens / self.num_experts).to(torch.long).item()
             self.max_tokens_per_expert = total_tokens.item()
             # handle bin alignment - maximum between configured alignment and TP (if used)
@@ -164,8 +172,11 @@ class CapacityBins(torch.nn.Module):
             if groups._get_expert_model_parallel_world_size() == 1 and groups.mpu is not None:
                 tp_alignment = groups.mpu.get_tensor_model_parallel_world_size()
             self.alignment = max(self.configured_alignment, tp_alignment)
-            # generate bins
+
+        # if not loading from a checkpoint, initialize bins
+        if self.capacity_bins[0] == 0:
             self.capacity_bins = self._generate_bins()
+
         return self.capacity_bins
 
 
