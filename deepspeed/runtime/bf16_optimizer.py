@@ -8,7 +8,9 @@ import torch
 import sys
 import os
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from deepspeed.utils import groups
 from deepspeed import comm as dist
+from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.constants import PIPE_REPLICATED
 from deepspeed.runtime import ZeROOptimizer
 from packaging import version as pkg_version
@@ -24,6 +26,12 @@ from deepspeed.checkpoint import enable_universal_checkpoint
 from deepspeed.checkpoint.constants import (DS_VERSION, PARTITION_COUNT, BASE_OPTIMIZER_STATE,
                                             SINGLE_PARTITION_OF_FP32_GROUPS, CLIP_GRAD, GROUP_PADDINGS,
                                             PARAM_SLICE_MAPPINGS)
+from deepspeed.moe.utils import is_moe_param
+
+try:
+    from torch._six import inf
+except ModuleNotFoundError:
+    from torch import inf
 
 setattr(sys.modules[__name__], 'fragment_address', fragment_address)
 
@@ -41,7 +49,8 @@ class BF16_Optimizer(ZeROOptimizer):
                  timers=None,
                  grad_acc_dtype=None,
                  graph_harvesting=False,
-                 immediate_grad_update=False):
+                 immediate_grad_update=False,
+                 has_moe_layers=False):
         super().__init__()
         see_memory_usage('begin bf16_optimizer', force=True)
         self.timers = timers
@@ -59,8 +68,15 @@ class BF16_Optimizer(ZeROOptimizer):
         self.mpu = mpu
         self.allgather_bucket_size = int(allgather_bucket_size)
         self.dp_process_group = dp_process_group
-        self.dp_rank = dist.get_rank(group=self.dp_process_group)
-        self.real_dp_process_group = [dp_process_group for i in range(len(self.optimizer.param_groups))]
+        self.has_moe_layers = has_moe_layers
+
+        # Set dp process groups for param groups
+        self.real_dp_process_group = []
+        for group in self.optimizer.param_groups:
+            if self._is_moe_group(group):
+                self.real_dp_process_group.append(groups._get_expert_data_parallel_group(group['name']))
+            else:
+                self.real_dp_process_group.append(dp_process_group)
 
         # Use torch (un)flatten ops
         self.flatten = _flatten_dense_tensors
@@ -92,12 +108,12 @@ class BF16_Optimizer(ZeROOptimizer):
         see_memory_usage('end bf16_optimizer', force=True)
 
     def _setup_for_real_optimizer(self):
-        dp_world_size = dist.get_world_size(group=self.dp_process_group)
-        self.partition_count = [dp_world_size for i in range(len(self.optimizer.param_groups))]
+        self.partition_count = [dist.get_world_size(group) for group in self.real_dp_process_group]
 
         for i, param_group in enumerate(self.optimizer.param_groups):
             see_memory_usage(f'before initializing group {i}', force=True)
 
+            dp_world_size = self.partition_count[i]
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
 
             # grab the original list
@@ -192,10 +208,10 @@ class BF16_Optimizer(ZeROOptimizer):
         return param_mapping
 
     def _link_all_hp_params(self):
-        dp_world_size = dist.get_world_size(group=self.dp_process_group)
         for i, _ in enumerate(self.optimizer.param_groups):
             # Link bf16 and fp32 params in partition
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
+            dp_world_size = dist.get_world_size(group=self.real_dp_process_group[i])
             partition_size = self.bf16_groups_flat[i].numel() // dp_world_size
             flat_hp_partition = self.fp32_groups_flat_partition[i]
             link_hp_params(lp_param_list=self.bf16_groups[i],
@@ -253,15 +269,53 @@ class BF16_Optimizer(ZeROOptimizer):
     def _flatten_dense_tensors_aligned(self, tensor_list, alignment):
         return self.flatten(align_dense_tensors(tensor_list, alignment))
 
+    def _get_norm_with_moe_layers(self, non_expert_norm, expert_tensors, norm_type=2):
+
+        def to_tensor(v):
+            return get_accelerator().FloatTensor(float(v)).detach()
+
+        group_norms = [non_expert_norm]
+        for exp_name, tensors in expert_tensors.items():
+            group_norm = get_global_norm_of_tensors(input_tensors=tensors,
+                                                    mpu=self.mpu,
+                                                    norm_type=self.norm_type,
+                                                    use_graph=self.graph_harvesting,
+                                                    moe_ep_group=groups._get_expert_parallel_group(exp_name))
+            group_norms.append(group_norm)
+
+        # check if all norms are valid
+        group_norms = torch.stack([to_tensor(norm) for norm in group_norms])
+        if group_norms.eq(-1).any():
+            return -1
+
+        # combine norms
+        if norm_type == inf:
+            total_norm = group_norms.max().item()
+        else:
+            total_norm = group_norms.pow(norm_type).sum()
+            total_norm = total_norm.item()**(1. / norm_type)
+            if total_norm == float('inf') or total_norm == -float('inf'):
+                total_norm = -1
+
+        return total_norm
+
     @torch.no_grad()
     def step(self, closure=None):
         if closure is not None:
             raise NotImplementedError(f'{self.__class__} does not support closure.')
 
-        all_groups_norm = get_global_norm_of_tensors(input_tensors=self.get_grads_for_norm(),
+        non_expert_grads = self.get_grads_for_norm()
+        all_groups_norm = get_global_norm_of_tensors(input_tensors=non_expert_grads,
                                                      mpu=self.mpu,
                                                      norm_type=self.norm_type,
                                                      use_graph=self.graph_harvesting)
+
+        if self.has_moe_layers:
+            _, expert_grads = self.get_grads_for_reduction()
+            all_groups_norm = self._get_norm_with_moe_layers(non_expert_norm=all_groups_norm,
+                                                             expert_tensors=expert_grads,
+                                                             norm_type=self.norm_type)
+
         self._global_grad_norm = all_groups_norm
 
         assert all_groups_norm > 0.
@@ -335,22 +389,23 @@ class BF16_Optimizer(ZeROOptimizer):
                     continue
                 self.fp32_groups_has_gradients[i][j] = True
 
+    @staticmethod
+    def _is_moe_group(g):
+        return g.get('moe', False)
+
     @torch.no_grad()
     def get_grads_for_reduction(self):
-
-        def is_moe_group(g):
-            return g.get('moe', False)
 
         # collect non-moe groups
         non_experts_gradients = []
         for i, group in enumerate(self.param_groups):
-            if not is_moe_group(group):
+            if not self._is_moe_group(group):
                 non_experts_gradients.append(self.fp32_groups_gradients_flat[i])
 
         # get all moe data parallel group names
         moe_dp_names = set()
         for group in self.param_groups:
-            if is_moe_group(group):
+            if self._is_moe_group(group):
                 moe_dp_names.add(group['name'])
 
         # collect moe groups, keyed by moe dp name
@@ -359,7 +414,7 @@ class BF16_Optimizer(ZeROOptimizer):
             moe_dp_names = list(moe_dp_names)
             experts_gradients = {name: [] for name in moe_dp_names}
             for i, group in enumerate(self.param_groups):
-                if is_moe_group(group):
+                if self._is_moe_group(group):
                     name = group['name']
                     experts_gradients[name].append(self.fp32_groups_gradients_flat[i])
 
@@ -376,6 +431,9 @@ class BF16_Optimizer(ZeROOptimizer):
                         continue
 
                     if not (tensor_mp_rank == 0 or is_model_parallel_parameter(lp)):
+                        continue
+
+                    if is_moe_param(lp):
                         continue
 
                 if not self.fp32_groups_has_gradients[i][j]:

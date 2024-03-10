@@ -824,7 +824,7 @@ def clip_gradients(parameters, max_norm=1.0, global_grad_norm=None, mpu=None, ep
     return global_grad_norm
 
 
-def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, use_graph=False):
+def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, use_graph=False, moe_ep_group=None):
     """Get norm of an iterable of tensors.
 
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -834,6 +834,7 @@ def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, use_graph=F
         input_tensors (Iterable[Tensor]): an iterable of Tensors will have norm computed
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
+        moe_ep_group (process group or None): for MoE tensors, provide the MoE expert parallel group
 
     Returns:
         Total norm of the tensors (viewed as a single vector).
@@ -846,7 +847,14 @@ def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, use_graph=F
         total_norm = max(t.data.abs().max() for t in input_tensors)
         total_norm_cuda = get_accelerator().FloatTensor([float(total_norm)])
         if mpu is not None:
-            dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.MAX, group=mpu.get_model_parallel_group())
+            # Max across model parallel; For MoE grads, only max if MoE-TP is enabled
+            if moe_ep_group is None or groups._get_expert_model_parallel_world_size() > 1:
+                dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.MAX, group=mpu.get_model_parallel_group())
+
+            # For MoE grads, max across expert parallel group
+            if moe_ep_group is not None:
+                dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.MAX, group=moe_ep_group)
+
             total_norm = total_norm_cuda[0].item()
     else:
         if use_graph:
@@ -868,7 +876,14 @@ def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, use_graph=F
 
         total_norm_cuda = get_accelerator().FloatTensor([float(total_norm)]).detach()
         if mpu is not None:
-            dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.SUM, group=mpu.get_model_parallel_group())
+            # Sum across model parallel; For MoE grads, only sum if MoE-TP is enabled
+            if moe_ep_group is None or groups._get_expert_model_parallel_world_size() > 1:
+                dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.SUM, group=mpu.get_model_parallel_group())
+
+            # For MoE grads, sum across expert parallel group
+            if moe_ep_group is not None:
+                dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.SUM, group=moe_ep_group)
+
         total_norm = total_norm_cuda[0].item()**(1. / norm_type)
 
     if total_norm == float('inf') or total_norm == -float('inf') or total_norm != total_norm:
