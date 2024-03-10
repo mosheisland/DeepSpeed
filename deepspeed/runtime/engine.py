@@ -1478,7 +1478,8 @@ class DeepSpeedEngine(Module):
                                    timers=timers,
                                    grad_acc_dtype=self.get_data_types()[1],
                                    graph_harvesting=self.graph_harvesting(),
-                                   immediate_grad_update=self._config.bfloat16_immediate_grad_update)
+                                   immediate_grad_update=self._config.bfloat16_immediate_grad_update,
+                                   has_moe_layers=self.has_moe_layers)
 
         return optimizer
 
