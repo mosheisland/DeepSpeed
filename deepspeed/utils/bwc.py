@@ -76,3 +76,16 @@ def bwc_tensor_model_parallel_group(mpu=None):
     else:
         # Deprecated Megatron and DeepSpeed convention
         return mpu.get_model_parallel_group()
+
+
+def bwc_pipeline_parallel_world_size(mpu=None):
+    """Backwards-compatible way of querying the pipeline parallel world size."""
+    world_size = 1
+    if mpu is not None:
+        if hasattr(mpu, 'get_pipeline_model_parallel_world_size'):
+            # New Megatron and DeepSpeed convention (post pipeline-parallelism release)
+            world_size = mpu.get_pipeline_model_parallel_world_size()
+        elif hasattr(mpu, 'get_pipe_parallel_world_size'):
+            # DeepSpeed Topology
+            world_size = mpu.get_pipe_parallel_world_size()
+    return world_size
