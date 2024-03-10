@@ -15,10 +15,11 @@ from packaging import version as pkg_version
 
 from deepspeed.git_version_info import version
 from deepspeed.runtime.utils import (get_global_norm_of_tensors, clip_tensors_by_global_norm, DummyOptim,
-                                     align_dense_tensors, all_gather_dp_groups, bwc_tensor_model_parallel_rank,
-                                     is_model_parallel_parameter, see_memory_usage, graph_process)
+                                     align_dense_tensors, all_gather_dp_groups, is_model_parallel_parameter,
+                                     see_memory_usage, graph_process)
 
 from deepspeed.utils import link_hp_params, lazy_init_hp_params_optimizer_state, fragment_address
+from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
 from deepspeed.checkpoint import enable_universal_checkpoint
 from deepspeed.checkpoint.constants import (DS_VERSION, PARTITION_COUNT, BASE_OPTIMIZER_STATE,
                                             SINGLE_PARTITION_OF_FP32_GROUPS, CLIP_GRAD, GROUP_PADDINGS,
