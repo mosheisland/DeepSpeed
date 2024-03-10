@@ -337,7 +337,33 @@ class BF16_Optimizer(ZeROOptimizer):
 
     @torch.no_grad()
     def get_grads_for_reduction(self):
-        return self.fp32_groups_gradients_flat
+
+        def is_moe_group(g):
+            return g.get('moe', False)
+
+        # collect non-moe groups
+        non_experts_gradients = []
+        for i, group in enumerate(self.param_groups):
+            if not is_moe_group(group):
+                non_experts_gradients.append(self.fp32_groups_gradients_flat[i])
+
+        # get all moe data parallel group names
+        moe_dp_names = set()
+        for group in self.param_groups:
+            if is_moe_group(group):
+                moe_dp_names.add(group['name'])
+
+        # collect moe groups, keyed by moe dp name
+        experts_gradients = {}
+        if len(moe_dp_names) > 0:
+            moe_dp_names = list(moe_dp_names)
+            experts_gradients = {name: [] for name in moe_dp_names}
+            for i, group in enumerate(self.param_groups):
+                if is_moe_group(group):
+                    name = group['name']
+                    experts_gradients[name].append(self.fp32_groups_gradients_flat[i])
+
+        return non_experts_gradients, experts_gradients
 
     @torch.no_grad()
     def get_grads_for_norm(self, for_clipping=False):
