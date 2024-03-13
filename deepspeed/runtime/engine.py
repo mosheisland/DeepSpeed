@@ -2336,7 +2336,7 @@ class DeepSpeedEngine(Module):
         mom = self.get_mom()
         log_dist(f"step={step}, skipped={self.skipped_steps}, lr={lr}, mom={mom}", ranks=[0])
 
-    def allreduce_bucket(self, bucket, dp_group):
+    def allreduce_bucket(self, bucket, dp_group, scale=None):
         tensor = self.flatten(bucket)
 
         tensor_to_allreduce = tensor
@@ -2344,16 +2344,19 @@ class DeepSpeedEngine(Module):
         if self.communication_data_type != tensor.dtype:
             tensor_to_allreduce = tensor.to(self.communication_data_type)
 
+        if scale is None:
+            scale = dist.get_world_size(group=dp_group)
+
         if self.postscale_gradients():
             if self.gradient_predivide_factor() != 1.0:
                 tensor_to_allreduce.mul_(1.0 / self.gradient_predivide_factor())
 
             dist.all_reduce(tensor_to_allreduce, group=dp_group)
             if self.gradient_average:
-                if self.gradient_predivide_factor() != dist.get_world_size(group=dp_group):
-                    tensor_to_allreduce.mul_(self.gradient_predivide_factor() / dist.get_world_size(group=dp_group))
+                if self.gradient_predivide_factor() != scale:
+                    tensor_to_allreduce.mul_(self.gradient_predivide_factor() / scale)
         else:
-            tensor_to_allreduce.mul_(1. / dist.get_world_size(group=dp_group))
+            tensor_to_allreduce.mul_(1. / scale)
             dist.all_reduce(tensor_to_allreduce, group=dp_group)
 
         if self.communication_data_type != tensor.dtype and tensor is not tensor_to_allreduce:
@@ -2361,23 +2364,23 @@ class DeepSpeedEngine(Module):
 
         return tensor
 
-    def allreduce_and_copy(self, small_bucket, dp_group):
-        allreduced = self.allreduce_bucket(small_bucket, dp_group)
+    def allreduce_and_copy(self, small_bucket, dp_group, scale=None):
+        allreduced = self.allreduce_bucket(small_bucket, dp_group, scale=scale)
         for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
             buf.copy_(synced)
 
-    def allreduce_no_retain(self, bucket, dp_group, numel_per_bucket=500000000):
+    def allreduce_no_retain(self, bucket, dp_group, numel_per_bucket=500000000, scale=None):
         small_bucket = []
         numel = 0
         for tensor in bucket:
             small_bucket.append(tensor)
             numel = numel + tensor.numel()
             if numel > numel_per_bucket:
-                self.allreduce_and_copy(small_bucket, dp_group)
+                self.allreduce_and_copy(small_bucket, dp_group, scale=scale)
                 small_bucket = []
                 numel = 0
         if len(small_bucket) > 0:
-            self.allreduce_and_copy(small_bucket, dp_group)
+            self.allreduce_and_copy(small_bucket, dp_group, scale=scale)
 
     def _get_gradients_for_reduction(self):
         non_expert_grads = []
@@ -2428,6 +2431,9 @@ class DeepSpeedEngine(Module):
                 self.allreduce_no_retain(dense_bucket, dp_group=dp_group, numel_per_bucket=elements_per_buffer)
 
     def _reduce_expert_gradients(self, expert_grads, elements_per_buffer):
+        dp_pg = groups._get_data_parallel_group()
+        scale = dist.get_world_size(group=dp_pg)
+
         for ep_name, expert_grads_group in expert_grads.items():
             split_sparse_tensor_buckets, split_dense_tensor_buckets = split_half_float_double_sparse(
                 expert_grads_group)
@@ -2435,7 +2441,9 @@ class DeepSpeedEngine(Module):
             for _, sparse_bucket_tuple in enumerate(split_sparse_tensor_buckets):
                 if sparse_bucket_tuple:
                     bucket_type, sparse_bucket = sparse_bucket_tuple
-                    self.sparse_allreduce_no_retain(sparse_bucket, groups._get_expert_data_parallel_group(ep_name))
+                    self.sparse_allreduce_no_retain(sparse_bucket,
+                                                    groups._get_expert_data_parallel_group(ep_name),
+                                                    scale=scale)
 
             for _, dense_bucket_tuple in enumerate(split_dense_tensor_buckets):
                 if dense_bucket_tuple:
@@ -2443,7 +2451,8 @@ class DeepSpeedEngine(Module):
                     # Separate between diff groups
                     self.allreduce_no_retain(dense_bucket,
                                              dp_group=groups._get_expert_data_parallel_group(ep_name),
-                                             numel_per_bucket=elements_per_buffer)
+                                             numel_per_bucket=elements_per_buffer,
+                                             scale=scale)
 
     def buffered_allreduce_fallback(self, grads=None, elements_per_buffer=500000000):
         if grads is None:
@@ -2456,8 +2465,8 @@ class DeepSpeedEngine(Module):
         if self.has_moe_layers:
             self._reduce_expert_gradients(expert_grads, elements_per_buffer)
 
-    def sparse_allreduce_no_retain(self, bucket, dp_group):
-        allreduced_sparses = self.sparse_allreduce_bucket(bucket, dp_group)
+    def sparse_allreduce_no_retain(self, bucket, dp_group, scale=None):
+        allreduced_sparses = self.sparse_allreduce_bucket(bucket, dp_group, scale=scale)
         # Densify sparse tensor and copy back to original location
         for tensor in allreduced_sparses:
             if tensor.is_sparse:
@@ -2465,13 +2474,13 @@ class DeepSpeedEngine(Module):
             else:
                 tensor.orig_dense_tensor.copy_(tensor.to_dense())
 
-    def sparse_allreduce_bucket(self, bucket, dp_group):
+    def sparse_allreduce_bucket(self, bucket, dp_group, scale=None):
         sparse_list = []
         for sparse in bucket:
-            sparse_list.append(self.sparse_allreduce(sparse, dp_group))
+            sparse_list.append(self.sparse_allreduce(sparse, dp_group, scale=scale))
         return sparse_list
 
-    def sparse_allreduce(self, sparse, dp_group):
+    def sparse_allreduce(self, sparse, dp_group, scale=None):
         original_data_type = sparse.values.dtype
         if self.communication_data_type != sparse.values.dtype:
             if self.communication_data_type in (torch.float16, torch.bfloat16):
@@ -2483,12 +2492,14 @@ class DeepSpeedEngine(Module):
             indices = sparse.indices
             values = sparse.values
 
+        if scale is None:
+            scale = dist.get_world_size(group=dp_group)
+
         if self.postscale_gradients():
             if self.gradient_average:
-                values.mul_(self.gradient_predivide_factor() /
-                            (dist.get_world_size(group=dp_group) / float(self.sequence_parallel_size)))
+                values.mul_(self.gradient_predivide_factor() / (scale / float(self.sequence_parallel_size)))
         else:
-            values.mul_(1. / (dist.get_world_size(group=dp_group) / float(self.sequence_parallel_size)))
+            values.mul_(1. / (scale / float(self.sequence_parallel_size)))
 
         indices_device_list = self.sparse_all_gather(indices, dp_group)
         values_device_list = self.sparse_all_gather(values, dp_group)
